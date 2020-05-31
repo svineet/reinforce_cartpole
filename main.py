@@ -12,9 +12,6 @@ from torch.nn import functional as F
 from collections import deque
 from functools import reduce
 
-DEVICE = "cpu"
-device = torch.device(DEVICE)
-
 
 class Policy(nn.Module):
     """
@@ -34,16 +31,17 @@ class Policy(nn.Module):
 
 
 class Agent:
-    def __init__(self, env, alpha=0.001,
-                       gamma=0.90, lr=0.001):
-        self.alpha = alpha
+    def __init__(self, env, gamma=0.99, lr=0.1,
+                       device_name="cpu",
+                       device=torch.device("cpu")):
         self.gamma = gamma
+        self.device = device
+        self.device_name = device_name
 
         state_size = reduce(lambda x, y: x*y, env.observation_space.shape)
         self.num_actions = env.action_space.n
         self.policy = Policy(state_size, self.num_actions)
 
-        global device
         self.policy.to(device=device)
 
         self.optimizer = torch.optim.RMSprop(self.policy.parameters(), lr=lr)
@@ -55,10 +53,11 @@ class Agent:
         """
             Returns (action, log (pi(a_t | s_t)))
         """
-        global device
+        device = self.device
+
         st = torch.Tensor(state[None, :]).to(device=device)
         p = self.policy(st)
-        p2 = p[0].detach().numpy() if DEVICE == "cpu" else p[0].cpu().detach().numpy()
+        p2 = p[0].detach().numpy() if self.device_name == "cpu" else p[0].cpu().detach().numpy()
         choice = np.random.choice(range(self.num_actions), p=p2)
         return (choice, p[0, choice].log())
 
@@ -84,14 +83,13 @@ class Agent:
         discounted_rewards = deque([])
         cum_rew = 0
         full_rew = 0
-        for reward in reversed(self.rewards):
+        rewards = np.array(self.rewards)
+        for reward in reversed(rewards):
             full_rew += reward
             cum_rew = reward + self.gamma*cum_rew
             discounted_rewards.appendleft(cum_rew)
 
-        print("Full reward", full_rew)
-
-        global device
+        device = self.device
         discounted_rewards = torch.Tensor(discounted_rewards).to(device=device)
         logprobs = torch.stack(tuple(self.logprobs)).to(device=device)
         loss = - torch.sum( discounted_rewards*logprobs )
@@ -104,20 +102,24 @@ class Agent:
         torch.save(self.policy.state_dict(), "cartpole_policy_cpu.pkl")
 
     def load(self):
-        if DEVICE == "cuda":
+        if self.device_name == "cuda":
             self.policy.load_state_dict(torch.load("cartpole_policy.pkl"))
         else:
             self.policy.load_state_dict(
                     torch.load("cartpole_policy.pkl", map_location=lambda storage, loc: storage))
 
 
-RENDER_ENV = True
-
-def main(args):
-    env = gym.make('CartPole-v0')
-    agent = Agent(env)
+def train(args):
+    env = gym.make(args["ENVIRONMENT"])
+    agent = Agent(env, lr=args["LEARNING_RATE"])
     ema_reward = 0
-    agent.load()
+
+    stats = {
+        "reward_ema": deque([])
+    }
+
+    if args["LOAD_POLICY"]: agent.load()
+
     for i in range(args["NUM_EPISODES"]):
         print("Starting episode", i)
         state = env.reset()
@@ -128,8 +130,9 @@ def main(args):
             action, logprob = agent.get_action(state)
             new_state, reward, done, _ = env.step(action)
             agent.step(state, action, reward, logprob)
+            total += reward
 
-            if RENDER_ENV:
+            if args["RENDER_ENV"]:
                 env.render()
 
             state = new_state
@@ -138,17 +141,29 @@ def main(args):
         agent.chain_train()
 
         if i%10==0:
-            # agent.save()
+            agent.save()
+            stats["reward_ema"].append(ema_reward)
             print("EMA of Reward is", ema_reward)
 
-        if (ema_reward >= 195):
+        if args["STOP_AT_THRESHOLD"] and (ema_reward >= env.spec.reward_threshold):
             print("We have arrived in the AI age")
             agent.save()
-            # break
+            break
+
+    return stats
 
 
 if __name__ == '__main__':
-    main({
-        "NUM_EPISODES": 100,
-    })
+    stats = train({
+                    "NUM_EPISODES": 2000,
+                    "LEARNING_RATE": 0.001,
+                    "ENVIRONMENT": "CartPole-v0",
+                    "DEVICE": "cpu",
+                    "RENDER_ENV": False,
+                    "LOAD_POLICY": False,
+                    "STOP_AT_THRESHOLD": False
+                })
+
+    plt.plot(stats["reward_ema"])
+    plt.show()
 
